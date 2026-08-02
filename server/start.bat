@@ -42,7 +42,11 @@ if %ERRORLEVEL% NEQ 0 (
 echo [OK] qwen3:8b ready
 
 echo.
+
 echo [1/2] FastAPI server starting in a new window...
+
+set PATH=C:\Users\ohje\AppData\Local\Programs\Python\Python311\Lib\site-packages\nvidia\cublas\bin;%PATH%
+
 start "SENA - FastAPI Server" python main.py
 
 echo [2/2] Cloudflare Tunnel starting...

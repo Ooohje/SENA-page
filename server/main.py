@@ -1,8 +1,16 @@
 """
 SENA Backend — FastAPI server
-RTX 5070 Ti · WavLM scoring · Faster-Whisper STT · Ollama Qwen3-8B · Kokoro TTS
+RTX 5070 Ti · WavLM scoring · Faster-Whisper STT · Gemma-3-4B-it LLM · Kokoro TTS
 """
-import os, json, re, uuid, base64, io, subprocess
+import os, json, re, uuid, base64, io, subprocess, asyncio
+import site
+
+# CUDA DLL path fix for Windows (cublas64_12.dll)
+for site_pkg in site.getsitepackages():
+    cublas_bin = os.path.join(site_pkg, "nvidia", "cublas", "bin")
+    if os.path.exists(cublas_bin):
+        os.add_dll_directory(cublas_bin)
+        break
 from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -12,9 +20,8 @@ import torch
 import numpy as np
 import librosa
 import torch.nn as nn
-from transformers import AutoModel, AutoFeatureExtractor
+from transformers import AutoModel, AutoFeatureExtractor, AutoTokenizer, AutoModelForCausalLM
 from faster_whisper import WhisperModel
-import httpx
 import soundfile as sf
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
@@ -45,9 +52,8 @@ TMP_DIR.mkdir(exist_ok=True)
 RPT_DIR.mkdir(exist_ok=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-BACKBONE     = "microsoft/wavlm-base"
-OLLAMA_BASE  = "http://localhost:11434"
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+BACKBONE  = "microsoft/wavlm-base"
+LLM_MODEL = "google/gemma-3-4b-it"
 
 # ── Global model registry ─────────────────────────────────────────────────────
 G: dict = {}       # evaluator, stt, tts
@@ -139,7 +145,14 @@ class STTEngine:
         print("[STT] ✅ ready")
 
     def transcribe(self, path: str) -> str:
-        segs, _ = self.model.transcribe(path, language="en", beam_size=5, vad_filter=True)
+        segs, _ = self.model.transcribe(
+            path,
+            task="transcribe",
+            language="en",
+            beam_size=5,
+            temperature=0,
+            vad_filter=True,
+        )
         return " ".join(s.text.strip() for s in segs).strip()
 
 
@@ -176,45 +189,95 @@ class TTSEngine:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LLM — Ollama Qwen3-8B
+# LLM — Gemma-3-4B-it (HuggingFace Transformers)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _strip_think(text: str) -> str:
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+class LLMEngine:
+    def __init__(self, model_name: str = LLM_MODEL):
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[LLM] loading {model_name} on {dev}…")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model     = AutoModelForCausalLM.from_pretrained(model_name).to(dev)
+        self.dev       = dev
+        print("[LLM] ✅ ready")
 
-async def _ollama(messages: list, think: bool = False, max_tokens: int = 400) -> str:
-    msgs = [dict(m) for m in messages]
-    if not think:
-        # Disable Qwen3 thinking mode for real-time turns
-        for m in msgs:
-            if m["role"] == "system":
-                m["content"] = m["content"].rstrip() + "\n/no_think"
-                break
-    async with httpx.AsyncClient(timeout=180.0) as c:
-        r = await c.post(
-            f"{OLLAMA_BASE}/api/chat",
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": msgs,
-                "stream": False,
-                "options": {"temperature": 0.7 if not think else 0.3, "num_predict": max_tokens},
-            },
+    def _generate_sync(self, messages: list, max_new_tokens: int) -> str:
+        
+        print("\n===== LLM INPUT =====")
+        for m in messages:
+            print(m["role"], ":", m["content"][:300])
+        print("====================\n")
+        
+        inputs = self.tokenizer.apply_chat_template(
+        messages,
+        return_tensors="pt",
+        add_generation_prompt=True,
         )
-        r.raise_for_status()
-        return _strip_think(r.json()["message"]["content"])
+
+        inputs = {k: v.to(self.dev) for k, v in inputs.items()}
+
+        output_ids = self.model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        temperature=0.7,
+        pad_token_id=self.tokenizer.eos_token_id,
+        do_sample=True,
+        )
+
+        new_tokens = output_ids[0][inputs["input_ids"].shape[1]:]
+
+        return self.tokenizer.decode(
+        new_tokens,
+        skip_special_tokens=True
+    ).strip()
+
+    async def generate(self, messages: list, max_new_tokens: int = 300) -> str:
+        return await asyncio.to_thread(self._generate_sync, messages, max_new_tokens)
+
 
 _LEVELS = {"beg": "beginner", "int": "intermediate", "adv": "advanced"}
 _TOPIC_STYLE = {
     "opic":      "Ask the learner to describe personal experiences, routines, and opinions — the kind of open-ended questions used in spoken English assessments.",
-    "free":      "Have a relaxed, casual chat about whatever is on the learner's mind.",
     "biz":       "Simulate professional workplace situations: status updates, meetings, emails, negotiations.",
     "travel":    "Roleplay travel situations: airports, hotels, asking for directions, ordering food.",
     "interview": "Conduct a natural English job interview: background, strengths, experience, goals.",
     "daily":     "Chat about everyday topics: food, hobbies, weekend plans, daily routines.",
 }
 
+_SENTENCE_COUNT = {"beg": 2, "int": 4, "adv": 6}
+
+_LEVEL_DESC = {
+    "beg": ("초급", "Think the student is a high school student. Use simple words and short sentences."),
+    "int": ("중급", "Think the student is an adult learner. Use moderate vocabulary and clear explanations."),
+    "adv": ("고급", "Think the student wants to speak like a native speaker. Use advanced vocabulary and natural expressions."),
+}
+
 def _chat_system(level: str, topic: str) -> str:
-    style = _TOPIC_STYLE.get(topic, _TOPIC_STYLE["free"])
+    if topic == "free":
+        level_ko, level_desc = _LEVEL_DESC.get(level, _LEVEL_DESC["int"])
+        count = _SENTENCE_COUNT.get(level, 4)
+        return (
+            "You are a friendly English conversation tutor.\n\n"
+            "Your Persona:\n"
+            "- You are friendly, encouraging, and patient.\n"
+            "- Your goal is to make the student feel comfortable and encourage them to speak more.\n\n"
+            "Conversation Rules:\n"
+            f"1. Be expressive: Your response should be around {count} complete sentences.\n"
+            "2. Always ask a question: You MUST end your response with a question to keep the conversation going.\n"
+            "3. Paraphrase, Don't Repeat: You MUST NEVER repeat the student's sentences or key phrases.\n"
+            "4. Stay in Your Role: You are the Tutor. Do NOT write 'Student:' as part of your response.\n"
+            "5. Respond naturally according to the student's level.\n"
+            "6. End sentences properly: All sentences must end with proper punctuation (., !, ?).\n\n"
+            f"Level guidance — Difficulty: {level_ko}\n"
+            f"- {level_desc}\n\n"
+            "Examples:\n"
+            "(Good) Student: 'I enjoyed watching a movie yesterday.'\n"
+            "Tutor: 'That sounds like a fun way to relax! It's great to take a break sometimes. What kind of film was it?'\n\n"
+            "(Bad — no question) Student: 'I like listening to music.'\n"
+            "Tutor: 'That's a great hobby. Music can be very relaxing.'\n\n"
+            "Send only your reply as the Tutor. Do not include 'Tutor:' or 'Student:' labels."
+        )
+    style = _TOPIC_STYLE.get(topic, _TOPIC_STYLE["opic"])
     return (
         f"You are SENA, a friendly AI English tutor for Korean learners. "
         f"The learner's level is {_LEVELS.get(level, 'intermediate')}. "
@@ -357,6 +420,7 @@ async def lifespan(app: FastAPI):
     print("  SENA Backend  —  model loading…")
     print("═"*48)
     G["evaluator"] = SpeechEvaluator()
+    G["llm"]       = LLMEngine()
     G["stt"]       = STTEngine()
     G["tts"]       = TTSEngine() if _KOKORO_OK else None
     print("═"*48)
@@ -421,6 +485,13 @@ async def chat_turn(
     lang:    str                    = Form("ko"),
     audio:   Optional[UploadFile]   = File(None),
 ):
+    
+    print("===== CHAT REQUEST =====")
+    print("level:", level)
+    print("topic:", topic)
+    print("history:", history[:200])
+    print("audio:", audio.filename if audio else None)
+
     hist        = json.loads(history)
     user_text   = ""
     utter_score = None
@@ -454,7 +525,7 @@ async def chat_turn(
     if user_text:
         messages.append({"role": "user", "content": user_text})
 
-    ai_text = await _ollama(messages, think=False, max_tokens=300)
+    ai_text = await G["llm"].generate(messages, max_new_tokens=300)
 
     # TTS
     ai_audio_b64 = ""
@@ -520,9 +591,9 @@ async def report_generate(payload: dict):
         )
         user_msg = f"Conversation:\n\n{transcript}"
 
-    raw = await _ollama(
+    raw = await G["llm"].generate(
         [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_msg}],
-        think=True, max_tokens=1400,
+        max_new_tokens=1400,
     )
 
     report: dict = {}

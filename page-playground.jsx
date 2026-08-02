@@ -644,12 +644,20 @@ function FreeTalkDemo({ t, lang, serverStatus }) {
     setState("thinking");
     try {
       const blob = await recorderRef.current.stop();
-      const turn = await window.SENA_API.chatTurn({
-        level, topic,
-        history: messages,
-        audioBlob: blob,
-        lang,
-      });
+      const cleanHistory = messages.map(m => ({
+        who: m.who,
+        text: m.text,
+        score: m.score || null,
+      }));
+
+    const turn = await window.SENA_API.chatTurn({
+      level,
+      topic,
+      history: cleanHistory,
+      audioBlob: blob,
+      lang,
+    });
+    console.log("TURN RESULT:", turn);
       const newMessages = [
         ...messages,
         { who: "you", text: turn.userText, score: turn.utteranceScore },
